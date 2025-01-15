@@ -1,13 +1,11 @@
 import itertools
-import time
-from pathlib import Path
-
 import numpy as np
 import scipy.optimize
+import shelve
+from pathlib import Path
 from numba import njit
 from numba.typed import List
-
-# import shelve
+import time
 
 ###################################### Eikonal Solver ######################################
 # |\nabla u| = f
@@ -94,8 +92,6 @@ def eikonal_solve(u, f, h):
 ###################################### Traveltime based on Eikonal Timetable ######################################
 @njit
 def _get_index(ir, iz, nr, nz, order="C"):
-    assert np.all(ir >= 0) and np.all(ir < nr)
-    assert np.all(iz >= 0) and np.all(iz < nz)
     if order == "C":
         return ir * nz + iz
     elif order == "F":
@@ -120,18 +116,14 @@ def test_get_index():
 def _interp(time_table, r, z, rgrid0, zgrid0, nr, nz, h):
     ir0 = np.floor((r - rgrid0) / h).clip(0, nr - 2).astype(np.int64)
     iz0 = np.floor((z - zgrid0) / h).clip(0, nz - 2).astype(np.int64)
-    r = r.clip(rgrid0, rgrid0 + (nr - 1) * h)
-    z = z.clip(zgrid0, zgrid0 + (nz - 1) * h)
-    # ir0 = ((r - rgrid0) / h).astype(np.int64)
-    # iz0 = ((z - zgrid0) / h).astype(np.int64)
     ir1 = ir0 + 1
     iz1 = iz0 + 1
 
     ## https://en.wikipedia.org/wiki/Bilinear_interpolation
     x1 = ir0 * h + rgrid0
     x2 = ir1 * h + rgrid0
-    z1 = iz0 * h + zgrid0
-    z2 = iz1 * h + zgrid0
+    y1 = iz0 * h + zgrid0
+    y2 = iz1 * h + zgrid0
 
     Q11 = time_table[_get_index(ir0, iz0, nr, nz)]
     Q12 = time_table[_get_index(ir0, iz1, nr, nz)]
@@ -141,12 +133,12 @@ def _interp(time_table, r, z, rgrid0, zgrid0, nr, nz, h):
     t = (
         1
         / (x2 - x1)
-        / (z2 - z1)
+        / (y2 - y1)
         * (
-            Q11 * (x2 - r) * (z2 - z)
-            + Q21 * (r - x1) * (z2 - z)
-            + Q12 * (x2 - r) * (z - z1)
-            + Q22 * (r - x1) * (z - z1)
+            Q11 * (x2 - r) * (y2 - z)
+            + Q21 * (r - x1) * (y2 - z)
+            + Q12 * (x2 - r) * (z - y1)
+            + Q22 * (r - x1) * (z - y1)
         )
     )
 
@@ -163,8 +155,6 @@ def traveltime(event_loc, station_loc, phase_type, eikonal):
     nz = eikonal["nz"]
     h = eikonal["h"]
 
-    if isinstance(phase_type, list):
-        phase_type = np.array(phase_type)
     p_index = phase_type == "p"
     s_index = phase_type == "s"
     tt = np.zeros(len(phase_type), dtype=np.float32)
@@ -185,8 +175,6 @@ def grad_traveltime(event_loc, station_loc, phase_type, eikonal):
     nz = eikonal["nz"]
     h = eikonal["h"]
 
-    if isinstance(phase_type, list):
-        phase_type = np.array(phase_type)
     p_index = phase_type == "p"
     s_index = phase_type == "s"
     dt_dr = np.zeros(len(phase_type))
@@ -196,7 +184,7 @@ def grad_traveltime(event_loc, station_loc, phase_type, eikonal):
     dt_dz[p_index] = _interp(eikonal["grad_up"][1], r[p_index], z[p_index], rgrid0, zgrid0, nr, nz, h)
     dt_dz[s_index] = _interp(eikonal["grad_us"][1], r[s_index], z[s_index], rgrid0, zgrid0, nr, nz, h)
 
-    dr_dxy = (event_loc[:, :2] - station_loc[:, :2]) / (r[:, np.newaxis] + 1e-6)
+    dr_dxy = (event_loc[:, :-2] - station_loc[:, :-1]) / (r[:, np.newaxis] + 1e-6)
     dt_dxy = dt_dr[:, np.newaxis] * dr_dxy
 
     grad = np.column_stack((dt_dxy, dt_dz[:, np.newaxis]))
@@ -229,8 +217,6 @@ def calc_mag(data, event_loc, station_loc, weight, min=-2, max=8):
     # c0, c1, c2, c3, c4 = (-4.151, 1.762, -0.09509, -1.669, -0.0006)
     # mag_ = (data - c0 - c3*np.log10(dist))/c1
     # mag = np.sum(mag_ * weight) / (np.sum(weight)+1e-6)
-    # (Watanabe, 1971) https://www.jstage.jst.go.jp/article/zisin1948/24/3/24_3_189/_pdf/-char/ja
-    # mag_ = 1.0/0.85 * (data + 1.73 * np.log10(np.maximum(dist, 0.1)) + 2.50)
     mu = np.sum(mag_ * weight) / (np.sum(weight) + 1e-6)
     std = np.sqrt(np.sum((mag_ - mu) ** 2 * weight) / (np.sum(weight) + 1e-12))
     mask = np.abs(mag_ - mu) <= 2 * std
@@ -248,8 +234,6 @@ def calc_amp(mag, event_loc, station_loc):
     ## Atkinson, G. M. (2015). Ground-Motion Prediction Equation...
     # c0, c1, c2, c3, c4 = (-4.151, 1.762, -0.09509, -1.669, -0.0006)
     # logA = c0 + c1*mag + c3*np.log10(dist)
-    # (Watanabe, 1971) https://www.jstage.jst.go.jp/article/zisin1948/24/3/24_3_189/_pdf/-char/ja
-    # logA = 0.85 * mag - 2.50 - 1.73 * np.log10(np.maximum(dist, 0.1))
     return logA
 
 
@@ -301,7 +285,7 @@ def calc_loc(
     max_iter=100,
     convergence=1e-6,
 ):
-
+    
     opt = scipy.optimize.minimize(
         huber_loss_grad,
         np.squeeze(event_loc0),
@@ -315,6 +299,7 @@ def calc_loc(
     return opt.x[np.newaxis, :], opt.fun
 
 
+
 def initialize_eikonal(config):
     path = Path("./eikonal")
     path.mkdir(exist_ok=True)
@@ -322,56 +307,55 @@ def initialize_eikonal(config):
     zlim = config["zlim"]
     h = config["h"]
 
-    # filename = f"timetable_{rlim[0]:.0f}_{rlim[1]:.0f}_{zlim[0]:.0f}_{zlim[1]:.0f}_{h:.3f}"
-    # if (path / (filename + ".dir")).is_file():
-    #     print("Loading precomputed timetable...")
-    #     with shelve.open(str(path / filename)) as db:
-    #         up = db["up"]
-    #         us = db["us"]
-    #         grad_up = db["grad_up"]
-    #         grad_us = db["grad_us"]
-    #         rgrid = db["rgrid"]
-    #         zgrid = db["zgrid"]
-    #         nr = db["nr"]
-    #         nz = db["nz"]
-    #         h = db["h"]
-    # else:
+    filename = f"timetable_{rlim[0]:.0f}_{rlim[1]:.0f}_{zlim[0]:.0f}_{zlim[1]:.0f}_{h:.3f}"
+    if (path / (filename + ".dir")).is_file():
+        print("Loading precomputed timetable...")
+        with shelve.open(str(path / filename)) as db:
+            up = db["up"]
+            us = db["us"]
+            grad_up = db["grad_up"]
+            grad_us = db["grad_us"]
+            rgrid = db["rgrid"]
+            zgrid = db["zgrid"]
+            nr = db["nr"]
+            nz = db["nz"]
+            h = db["h"]
+    else:
+        edge_grids = 0
 
-    rgrid = np.arange(rlim[0], rlim[1], h)
-    zgrid = np.arange(zlim[0], zlim[1], h)
-    nr, nz = len(rgrid), len(zgrid)
+        rgrid = np.arange(rlim[0] - edge_grids * h, rlim[1], h)
+        zgrid = np.arange(zlim[0] - edge_grids * h, zlim[1], h)
+        nr, nz = len(rgrid), len(zgrid)
 
-    vel = config["vel"]
-    zz, vp, vs = vel["z"], vel["p"], vel["s"]
-    vp1d = np.interp(zgrid, zz, vp)
-    vs1d = np.interp(zgrid, zz, vs)
-    vp = np.ones((nr, nz)) * vp1d
-    vs = np.ones((nr, nz)) * vs1d
+        vel = config["vel"]
+        zz, vp, vs = vel["z"], vel["p"], vel["s"]
+        vp1d = np.interp(zgrid, zz, vp)
+        vs1d = np.interp(zgrid, zz, vs)
+        vp = np.ones((nr, nz)) * vp1d
+        vs = np.ones((nr, nz)) * vs1d
 
-    ir0 = np.around((0 - rlim[0]) / h).astype(np.int64)
-    iz0 = np.around((0 - zlim[0]) / h).astype(np.int64)
-    up = 1000.0 * np.ones((nr, nz))
-    up[ir0, iz0] = 0.0
-    up = eikonal_solve(up, vp, h)
+        up = 1000.0 * np.ones((nr, nz))
+        up[edge_grids, edge_grids] = 0.0
+        up = eikonal_solve(up, vp, h)
 
-    grad_up = np.gradient(up, h)
+        grad_up = np.gradient(up, h)
 
-    us = 1000.0 * np.ones((nr, nz))
-    us[ir0, iz0] = 0.0
-    us = eikonal_solve(us, vs, h)
+        us = 1000.0 * np.ones((nr, nz))
+        us[edge_grids, edge_grids] = 0.0
+        us = eikonal_solve(us, vs, h)
 
-    grad_us = np.gradient(us, h)
+        grad_us = np.gradient(us, h)
 
-    # with shelve.open(str(path / filename)) as db:
-    #     db["up"] = up
-    #     db["us"] = us
-    #     db["grad_up"] = grad_up
-    #     db["grad_us"] = grad_us
-    #     db["rgrid"] = rgrid
-    #     db["zgrid"] = zgrid
-    #     db["nr"] = nr
-    #     db["nz"] = nz
-    #     db["h"] = h
+        with shelve.open(str(path / filename)) as db:
+            db["up"] = up
+            db["us"] = us
+            db["grad_up"] = grad_up
+            db["grad_us"] = grad_us
+            db["rgrid"] = rgrid
+            db["zgrid"] = zgrid
+            db["nr"] = nr
+            db["nz"] = nz
+            db["h"] = h
 
     up = up.flatten()
     us = us.flatten()
